@@ -792,6 +792,36 @@ static inline __m256i q2_0_dot_u8s8_avx2(const __m256i v, const __m256i y) {
     return _mm256_madd_epi16(_mm256_maddubs_epi16(v, y), _mm256_set1_epi16(1));
 #endif
 }
+
+// VNNI only: shifted codes reach 3 << 6 = 192, maddubs pairs (2 * 192 * 128) would saturate int16
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+#define GGML_Q2_0_PERM 1
+#endif
+
+// Permuted unpack for the block GEMM/GEMV: 32 codes of 8 bytes b0..b7 (code 4k+p = bits 2p of byte k) in 3 ops.
+// int32 lane d holds the codes of bytes 4*(d/4)+q, q = 0..3, all at bit position p = d%4, left in place (code << 2p);
+// the activations are permuted to match once per column (q2_0_perm_y_avx2) and lane d of the accumulator is
+// scaled by 4^-p at the end (exact: powers of two). The fp16 block scales are per lane-independent, so this commutes.
+static inline __m256i q2_0_unpack_perm_avx2(const uint8_t * qs) {
+    int64_t b;
+    memcpy(&b, qs, sizeof(b));
+    const __m256i idx = _mm256_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3,
+                                         4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7);
+    const __m256i msk = _mm256_setr_epi32(0x03030303, 0x0C0C0C0C, 0x30303030, (int) 0xC0C0C0C0,
+                                          0x03030303, 0x0C0C0C0C, 0x30303030, (int) 0xC0C0C0C0);
+    return _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi64x(b), idx), msk);
+}
+
+// activation byte for lane d, slot q: weight 16*(d/4) + 4q + d%4 (in-lane index 4q + d%4)
+static inline __m256i q2_0_perm_y_avx2(const int8_t * qy) {
+    const __m256i idx = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+                                         0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    return _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *) qy), idx);
+}
+
+static inline float q2_0_perm_hsum_avx2(__m256 acc) {
+    return hsum_float_8(_mm256_mul_ps(acc, _mm256_setr_ps(1.0f, 0.25f, 0.0625f, 0.015625f, 1.0f, 0.25f, 0.0625f, 0.015625f)));
+}
 #endif
 
 // Block GEMM for MUL_MAT_ID prefill: out[c][r] = dot(row r of x, column c of y)
@@ -813,10 +843,16 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
         const block_q8_0 * y = (const block_q8_0 * ) vy[0];
         float dy1[GGML_Q2_0_GEMM_MAX_N / QK8_0];
         float cy1[GGML_Q2_0_GEMM_MAX_N / QK2_0];
+#ifdef GGML_Q2_0_PERM
+        __m256i yp1[GGML_Q2_0_GEMM_MAX_N / QK8_0];
+#endif
         for (int ib = 0; ib < nx; ib++) {
             float c = 0.0f;
             for (int h = 0; h < 2; h++) {
                 const __m256i yv = _mm256_loadu_si256((const __m256i *) y[2*ib + h].qs);
+#ifdef GGML_Q2_0_PERM
+                yp1[2*ib + h] = q2_0_perm_y_avx2(y[2*ib + h].qs);
+#endif
                 dy1[2*ib + h] = GGML_CPU_FP16_TO_FP32(y[2*ib + h].d);
                 c += dy1[2*ib + h] * (float) hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(ones, yv), _mm256_set1_epi16(1)));
             }
@@ -838,16 +874,28 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
                     corr[k] += dx[k] * cy1[ib];
                 }
                 for (int h = 0; h < 2; h++) {
-                    const __m256i yv = _mm256_loadu_si256((const __m256i *) y[2*ib + h].qs);
                     const float   d  = dy1[2*ib + h];
+#ifdef GGML_Q2_0_PERM
+                    const __m256i yv = yp1[2*ib + h];
+#else
+                    const __m256i yv = _mm256_loadu_si256((const __m256i *) y[2*ib + h].qs);
+#endif
                     for (int k = 0; k < 4; k++) {
+#ifdef GGML_Q2_0_PERM
+                        const __m256i v = q2_0_unpack_perm_avx2(xr[k][ib].qs + 8 * h);
+#else
                         const __m256i v = q2_0_unpack_32_avx2(xr[k][ib].qs + 8 * h);
+#endif
                         acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(dx[k] * d), _mm256_cvtepi32_ps(q2_0_dot_u8s8_avx2(v, yv)), acc[k]);
                     }
                 }
             }
             for (int k = 0; k < rn; k++) {
+#ifdef GGML_Q2_0_PERM
+                out[0][r + k] = q2_0_perm_hsum_avx2(acc[k]) - corr[k];
+#else
                 out[0][r + k] = hsum_float_8(acc[k]) - corr[k];
+#endif
             }
         }
         return;
@@ -859,9 +907,15 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
     for (int c = 0; c < 16; c++) {
         ycol[c] = (const block_q8_0 *) vy[c < nc ? c : nc - 1]; // pad to a multiple of 4 with the last column
     }
+#ifdef GGML_Q2_0_PERM
+    __m256i yp[16][GGML_Q2_0_GEMM_MAX_N / QK8_0]; // permuted activations, 32 KiB of stack
+#endif
     for (int c = 0; c < nc; c++) {
         for (int b = 0; b < nb; b++) {
             const __m256i y = _mm256_loadu_si256((const __m256i *) ycol[c][b].qs);
+#ifdef GGML_Q2_0_PERM
+            yp[c][b] = q2_0_perm_y_avx2(ycol[c][b].qs);
+#endif
             const float s = (float) hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(ones, y), _mm256_set1_epi16(1)));
             dy[c][b] = GGML_CPU_FP16_TO_FP32(ycol[c][b].d);
             if (b % 2 == 0) {
@@ -874,6 +928,9 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
     for (int c = nc; c < 16; c++) {
         memcpy(dy[c], dy[nc - 1], nb * sizeof(float));
         memcpy(cy[c], cy[nc - 1], nx * sizeof(float));
+#ifdef GGML_Q2_0_PERM
+        memcpy(yp[c], yp[nc - 1], nb * sizeof(__m256i));
+#endif
     }
 
     float dx0[GGML_Q2_0_GEMM_MAX_N / QK2_0];
@@ -895,10 +952,19 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
             for (int ib = 0; ib < nx; ib++) {
                 for (int h = 0; h < 2; h++) {
                     const int b = 2 * ib + h;
+#ifdef GGML_Q2_0_PERM
+                    const __m256i v0 = q2_0_unpack_perm_avx2(x0[ib].qs + 8 * h);
+                    const __m256i v1 = q2_0_unpack_perm_avx2(x1[ib].qs + 8 * h);
+#else
                     const __m256i v0 = q2_0_unpack_32_avx2(x0[ib].qs + 8 * h);
                     const __m256i v1 = q2_0_unpack_32_avx2(x1[ib].qs + 8 * h);
+#endif
                     for (int j = 0; j < 4; j++) {
+#ifdef GGML_Q2_0_PERM
+                        const __m256i y = yp[c + j][b];
+#else
                         const __m256i y = _mm256_loadu_si256((const __m256i *) ycol[c + j][b].qs);
+#endif
                         const float d = dy[c + j][b];
                         acc0[j] = _mm256_fmadd_ps(_mm256_set1_ps(dx0[ib] * d), _mm256_cvtepi32_ps(q2_0_dot_u8s8_avx2(v0, y)), acc0[j]);
                         acc1[j] = _mm256_fmadd_ps(_mm256_set1_ps(dx1[ib] * d), _mm256_cvtepi32_ps(q2_0_dot_u8s8_avx2(v1, y)), acc1[j]);
@@ -912,10 +978,17 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
                     corr0 += dx0[ib] * cy[c + j][ib];
                     corr1 += dx1[ib] * cy[c + j][ib];
                 }
+#ifdef GGML_Q2_0_PERM
+                out[c + j][r] = q2_0_perm_hsum_avx2(acc0[j]) - corr0;
+                if (two) {
+                    out[c + j][r + 1] = q2_0_perm_hsum_avx2(acc1[j]) - corr1;
+                }
+#else
                 out[c + j][r] = hsum_float_8(acc0[j]) - corr0;
                 if (two) {
                     out[c + j][r + 1] = hsum_float_8(acc1[j]) - corr1;
                 }
+#endif
             }
         }
     }
