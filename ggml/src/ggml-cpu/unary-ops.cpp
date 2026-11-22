@@ -1,4 +1,7 @@
 #include "unary-ops.h"
+#include "vec.h"
+
+#include <type_traits>
 
 static inline float op_abs(float x) {
     return fabsf(x);
@@ -97,12 +100,48 @@ static inline float op_trunc(float x) {
     return truncf(x);
 }
 
+// returns the number of elements done, the scalar loop does the rest
+template <float (*op)(float)>
+static inline int64_t vec_unary_op_simd(int64_t /*n*/, float * /*y*/, const float * /*x*/) {
+    return 0;
+}
+
+#if defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512F__)
+template <>
+inline int64_t vec_unary_op_simd<op_tanh>(int64_t n, float * y, const float * x) {
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_tanh(_mm256_loadu_ps(x + i)));
+    }
+    return i;
+}
+
+template <>
+inline int64_t vec_unary_op_simd<op_sigmoid>(int64_t n, float * y, const float * x) {
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_sigmoid(_mm256_loadu_ps(x + i)));
+    }
+    return i;
+}
+#endif
+
 template <float (*op)(float), typename src0_t, typename dst_t>
-static inline void vec_unary_op(int64_t n, dst_t * y, const src0_t * x) {
+static inline void vec_unary_op(int64_t n, dst_t * y, const src0_t * x, bool use_ref) {
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
-    for (int i = 0; i < n; i++) {
+    int64_t i = 0;
+    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, float>) {
+        // the reference backend stays scalar, test-backend-ops compares against it
+        if (!use_ref) {
+            i = vec_unary_op_simd<op>(n, y, x);
+        }
+    } else {
+        GGML_UNUSED(use_ref);
+    }
+
+    for (; i < n; i++) {
         y[i] = f32_to_dst(op(src0_to_f32(x[i])));
     }
 }
@@ -128,7 +167,7 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
         dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
 
-        vec_unary_op<op>(ne0, dst_ptr, src0_ptr);
+        vec_unary_op<op>(ne0, dst_ptr, src0_ptr, params->use_ref);
     }
 }
 

@@ -1333,6 +1333,31 @@ inline static __m256 ggml_v_gelu_quick(__m256 x) {
     return _mm256_div_ps(x, _mm256_add_ps(one, exp_cx));
 }
 
+// sigmoid(x) = 1 / (1 + exp(-x))
+inline static __m256 ggml_v_sigmoid(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1);
+    const __m256 exp_neg_x = ggml_v_expf(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    return _mm256_div_ps(one, _mm256_add_ps(one, exp_neg_x));
+}
+
+// tanh(x) = 1 - 2 / (exp(2x) + 1), that form loses precision near 0, so use a series for |x| < 1/16
+inline static __m256 ggml_v_tanh(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1);
+    const __m256 two = _mm256_set1_ps(2);
+    const __m256 sign = _mm256_and_ps(x, _mm256_set1_ps(-0.f));
+    const __m256 abs_x = _mm256_xor_ps(x, sign);
+
+    const __m256 large = _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(ggml_v_expf(_mm256_add_ps(x, x)), one)));
+
+    const __m256 x2 = _mm256_mul_ps(x, x);
+    const __m256 poly = _mm256_fmadd_ps(x2, _mm256_set1_ps(2.f / 15.f), _mm256_set1_ps(-1.f / 3.f));
+    const __m256 small = _mm256_fmadd_ps(_mm256_mul_ps(x, x2), poly, x);
+
+    // the sum above turns -0 into +0, so put the sign back
+    const __m256 small_signed = _mm256_or_ps(small, sign);
+    return _mm256_blendv_ps(large, small_signed, _mm256_cmp_ps(abs_x, _mm256_set1_ps(0.0625f), _CMP_LT_OQ));
+}
+
 #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
 
 #if defined(__FMA__)
