@@ -8869,6 +8869,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * bias_table = dst->src[6];
+    const ggml_tensor * bias_idxs  = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8909,6 +8911,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     const int64_t rv2 = neq2/nev2;
     const int64_t rv3 = neq3/nev3;
+
+    const bool has_bias = bias_table != nullptr;
+    GGML_ASSERT(!has_bias || mask);
 
     // parallelize by q rows using ggml_vec_dot_f32
 
@@ -8973,12 +8978,25 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // indexed bias: mask[k,q] += table[h, idxs[k,q], q], rounded to F16 like a dense F16 mask; q flattened across streams
+        const int64_t   bq   = iq1 + iq3*neq1;
+        const int32_t * bidx = has_bias ? (const int32_t *) ((const char *) bias_idxs->data + bq*bias_idxs->nb[1]) : nullptr;
+        const char    * btab = has_bias ? (const char *) bias_table->data + bq*bias_table->nb[2] + h*bias_table->nb[0] : nullptr;
+        const size_t    bnb1 = has_bias ? bias_table->nb[1] : 0;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+            if (has_bias) {
+                mv = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(mv + *(const float *) (btab + bidx[ic]*bnb1)));
+            }
+            mv *= slope;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9156,6 +9174,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * kv_rows = dst->src[5];
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
+    // indexed bias: mask[k,q] += table[h, idxs[k,q], q], rounded to F16 like a dense F16 mask; q flattened across streams
+    const ggml_tensor * bias_table = dst->src[6];
+    const ggml_tensor * bias_idxs  = dst->src[7];
+    GGML_ASSERT(!bias_table || mask);
+
     int ir = ir0;
     while (ir < ir1) {
         // q indices for the start of this tile
@@ -9234,10 +9257,26 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
+                    if (bias_table) {
+                        const int64_t   bq   = iq1 + tq + iq3*neq1;
+                        const int32_t * bidx = (const int32_t *) ((const char *) bias_idxs->data + bq*bias_idxs->nb[1]);
+                        const char    * btab = (const char *) bias_table->data + bq*bias_table->nb[2] + h*bias_table->nb[0];
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                            if (m != -INFINITY) {
+                                m = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(m + *(const float *) (btab + bidx[ic + tk]*bias_table->nb[1])));
+                            }
+                            mask32[tq * KV_TILE_SZ + tk] = slope * m;
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
+                        }
+                    } else {
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
                         }
                     }
                     // Pad remaining mask entries with -inf
