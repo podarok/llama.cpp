@@ -780,6 +780,108 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX2__)
+// unsigned 2-bit codes (0..3) times int8 activations, 8 int32 lane sums
+static inline __m256i q2_0_dot_u8s8_avx2(const __m256i v, const __m256i y) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), v, y);
+#elif defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), v, y);
+#else
+    // |v*y pair| <= 2*3*128, no int16 saturation
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(v, y), _mm256_set1_epi16(1));
+#endif
+}
+#endif
+
+// Block GEMM for MUL_MAT_ID prefill: out[c][r] = dot(row r of x, column c of y)
+// for nr Q2_0 rows (row stride bx bytes) and nc <= 16 Q8_0 columns (vy[c]), n <= GGML_Q2_0_GEMM_MAX_N.
+// Each unpacked weight block is reused for 4 columns and the -1 code offset leaves the inner loop:
+// sum((v - 1) * y) * dx * dy = dx * dy * sum(v * y) - dx * (dy * sum(y)), with dy * sum(y) computed once per column.
+void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT vx, size_t bx,
+                         const void * const * vy, int nr, int nc) {
+#if defined(__AVX2__) && defined(__FMA__)
+    assert(n % QK2_0 == 0 && n <= GGML_Q2_0_GEMM_MAX_N);
+    assert(nr >= 1 && nc >= 1 && nc <= 16);
+    const int nb = n / QK8_0; // Q8_0 blocks per column, two per Q2_0 block
+
+    const int nx = n / QK2_0; // Q2_0 blocks per row
+    float dy[16][GGML_Q2_0_GEMM_MAX_N / QK8_0];
+    float cy[16][GGML_Q2_0_GEMM_MAX_N / QK2_0]; // dy * sum(y), summed over the two Q8_0 halves of a Q2_0 block
+    const block_q8_0 * ycol[16];
+    for (int c = 0; c < 16; c++) {
+        ycol[c] = (const block_q8_0 *) vy[c < nc ? c : nc - 1]; // pad to a multiple of 4 with the last column
+    }
+    const __m256i ones = _mm256_set1_epi8(1);
+    for (int c = 0; c < nc; c++) {
+        for (int b = 0; b < nb; b++) {
+            const __m256i y = _mm256_loadu_si256((const __m256i *) ycol[c][b].qs);
+            const float s = (float) hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(ones, y), _mm256_set1_epi16(1)));
+            dy[c][b] = GGML_CPU_FP16_TO_FP32(ycol[c][b].d);
+            if (b % 2 == 0) {
+                cy[c][b / 2] = dy[c][b] * s;
+            } else {
+                cy[c][b / 2] += dy[c][b] * s;
+            }
+        }
+    }
+    for (int c = nc; c < 16; c++) {
+        memcpy(dy[c], dy[nc - 1], nb * sizeof(float));
+        memcpy(cy[c], cy[nc - 1], nx * sizeof(float));
+    }
+
+    float dx0[GGML_Q2_0_GEMM_MAX_N / QK2_0];
+    float dx1[GGML_Q2_0_GEMM_MAX_N / QK2_0];
+    for (int r = 0; r < nr; r += 2) {
+        const bool two = r + 1 < nr;
+        const block_q2_0 * x0 = (const block_q2_0 *) ((const char *) vx + r * bx);
+        const block_q2_0 * x1 = two ? (const block_q2_0 *) ((const char *) vx + (r + 1) * bx) : x0;
+        for (int ib = 0; ib < nx; ib++) {
+            dx0[ib] = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+            dx1[ib] = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+        }
+        for (int c = 0; c < nc; c += 4) {
+            __m256 acc0[4], acc1[4];
+            for (int j = 0; j < 4; j++) {
+                acc0[j] = _mm256_setzero_ps();
+                acc1[j] = _mm256_setzero_ps();
+            }
+            for (int ib = 0; ib < nx; ib++) {
+                for (int h = 0; h < 2; h++) {
+                    const int b = 2 * ib + h;
+                    const __m256i v0 = q2_0_unpack_32_avx2(x0[ib].qs + 8 * h);
+                    const __m256i v1 = q2_0_unpack_32_avx2(x1[ib].qs + 8 * h);
+                    for (int j = 0; j < 4; j++) {
+                        const __m256i y = _mm256_loadu_si256((const __m256i *) ycol[c + j][b].qs);
+                        const float d = dy[c + j][b];
+                        acc0[j] = _mm256_fmadd_ps(_mm256_set1_ps(dx0[ib] * d), _mm256_cvtepi32_ps(q2_0_dot_u8s8_avx2(v0, y)), acc0[j]);
+                        acc1[j] = _mm256_fmadd_ps(_mm256_set1_ps(dx1[ib] * d), _mm256_cvtepi32_ps(q2_0_dot_u8s8_avx2(v1, y)), acc1[j]);
+                    }
+                }
+            }
+            for (int j = 0; j < 4 && c + j < nc; j++) {
+                float corr0 = 0.0f;
+                float corr1 = 0.0f;
+                for (int ib = 0; ib < nx; ib++) {
+                    corr0 += dx0[ib] * cy[c + j][ib];
+                    corr1 += dx1[ib] * cy[c + j][ib];
+                }
+                out[c + j][r] = hsum_float_8(acc0[j]) - corr0;
+                if (two) {
+                    out[c + j][r + 1] = hsum_float_8(acc1[j]) - corr1;
+                }
+            }
+        }
+    }
+#else
+    for (int c = 0; c < nc; c++) {
+        for (int r = 0; r < nr; r++) {
+            ggml_vec_dot_q2_0_q8_0(n, &out[c][r], 0, (const char *) vx + r * bx, 0, vy[c], 0, 1);
+        }
+    }
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
