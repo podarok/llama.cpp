@@ -1758,7 +1758,20 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
 #ifndef GGML_USE_ACCELERATE
     float max = -INFINITY;
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__AVX2__)
+    if (n >= 8) {
+        __m256 vmax = _mm256_set1_ps(-INFINITY);
+        for (; i + 8 <= n; i += 8) {
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(x + i));
+        }
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+        max = _mm_cvtss_f32(m4);
+    }
+#endif
+    for (; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;

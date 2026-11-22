@@ -9403,7 +9403,42 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
-            for (int tk = 0; tk < kv_tile; tk++) {
+            int tk0 = 0;
+#if defined(__AVX2__) && defined(__F16C__)
+            // F16: 8 K rows x 8 dims per step, converted with F16C and transposed in registers
+            if (kv_type == GGML_TYPE_F16 && DK % 8 == 0) {
+                for (; tk0 + 8 <= kv_tile; tk0 += 8) {
+                    const ggml_fp16_t * kr[8];
+                    for (int j = 0; j < 8; j++) {
+                        kr[j] = (const ggml_fp16_t *) ((const char *) k->data + kv_row(ic + tk0 + j)*nbk1 + ik2*nbk2 + ik3*nbk3);
+                    }
+                    for (int64_t dk = 0; dk < DK; dk += 8) {
+                        __m256 r[8];
+                        for (int j = 0; j < 8; j++) {
+                            r[j] = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (kr[j] + dk)));
+                        }
+                        const __m256 t0 = _mm256_unpacklo_ps(r[0], r[1]), t1 = _mm256_unpackhi_ps(r[0], r[1]);
+                        const __m256 t2 = _mm256_unpacklo_ps(r[2], r[3]), t3 = _mm256_unpackhi_ps(r[2], r[3]);
+                        const __m256 t4 = _mm256_unpacklo_ps(r[4], r[5]), t5 = _mm256_unpackhi_ps(r[4], r[5]);
+                        const __m256 t6 = _mm256_unpacklo_ps(r[6], r[7]), t7 = _mm256_unpackhi_ps(r[6], r[7]);
+                        const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44), u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+                        const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44), u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+                        const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44), u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+                        const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44), u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+                        float * out = K_f32 + dk * KV_TILE_SZ + tk0;
+                        _mm256_storeu_ps(out + 0*KV_TILE_SZ, _mm256_permute2f128_ps(u0, u4, 0x20));
+                        _mm256_storeu_ps(out + 1*KV_TILE_SZ, _mm256_permute2f128_ps(u1, u5, 0x20));
+                        _mm256_storeu_ps(out + 2*KV_TILE_SZ, _mm256_permute2f128_ps(u2, u6, 0x20));
+                        _mm256_storeu_ps(out + 3*KV_TILE_SZ, _mm256_permute2f128_ps(u3, u7, 0x20));
+                        _mm256_storeu_ps(out + 4*KV_TILE_SZ, _mm256_permute2f128_ps(u0, u4, 0x31));
+                        _mm256_storeu_ps(out + 5*KV_TILE_SZ, _mm256_permute2f128_ps(u1, u5, 0x31));
+                        _mm256_storeu_ps(out + 6*KV_TILE_SZ, _mm256_permute2f128_ps(u2, u6, 0x31));
+                        _mm256_storeu_ps(out + 7*KV_TILE_SZ, _mm256_permute2f128_ps(u3, u7, 0x31));
+                    }
+                }
+            }
+#endif
+            for (int tk = tk0; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + kv_row(ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
                 if (kv_type == GGML_TYPE_F16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
