@@ -46,6 +46,9 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #define GGML_Q2_0_GEMM_MAX_N 2048
 void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT vx, size_t bx,
                          const void * const * vy, int nr, int nc);
+// same for NVFP4 x Q8_0 (x86 AVX-VNNI only), nc <= 16, n <= GGML_Q2_0_GEMM_MAX_N
+void ggml_gemm_nvfp4_q8_0(int n, float * const * out, const void * GGML_RESTRICT vx, size_t bx,
+                          const void * const * vy, int nr, int nc);
 void ggml_vec_dot_f8_e4m3_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
