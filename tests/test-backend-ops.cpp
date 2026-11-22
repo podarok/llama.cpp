@@ -12364,6 +12364,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Q2_0 CPU block GEMM: Inkling 2 Mini ffn_down_exps shape (K 1152), ragged rows and tokens, broadcast
+    for (int n : {2, 3, 17, 33}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 16, 4, false, 2304, n, 1152));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, true, 37, n, 1152));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 4, 2, false, 65, n, 64));
+    }
+
     // Both experts receive every token
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
         for (int n : {64, 65}) {
