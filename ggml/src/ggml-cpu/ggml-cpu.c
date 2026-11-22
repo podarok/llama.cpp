@@ -1565,6 +1565,24 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
         return;
     }
 #endif
+#if defined(__AVX2__) && defined(__FMA__) && (defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__)))
+    // NVFP4 prefill: same block GEMM scheme (decode keeps the row-by-row dot)
+    if (!use_ref && type == GGML_TYPE_NVFP4 && vec_dot_type == GGML_TYPE_Q8_0 && ir1_end - ir1_start >= 2 &&
+        ne00 <= GGML_Q2_0_GEMM_MAX_N && (src1_cont || src1->type != vec_dot_type)) {
+        const void * cols[16];
+        float * dcols[16];
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            const int nc = (int) MIN(blck_1, ir1_end - iir1);
+            for (int c = 0; c < nc; c++) {
+                const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, iir1 + c);
+                cols[c]  = (const char *) wdata + (rm.i1 % ne11 + rm.i2 * ne11) * row_size;
+                dcols[c] = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + ir0_start;
+            }
+            ggml_gemm_nvfp4_q8_0((int) ne00, dcols, src0_cur + ir0_start * nb01, nb01, cols, (int) (ir0_end - ir0_start), nc);
+        }
+        return;
+    }
+#endif
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {

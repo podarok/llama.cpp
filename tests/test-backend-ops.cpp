@@ -12494,6 +12494,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 16, 4, false, 2304, n, 1152));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, true, 37, n, 1152));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 4, 2, false, 65, n, 64));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, false, 2304, n, 1152));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, true, 37, n, 1152));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, false, 65, n, 64));
     }
 
     // Both experts receive every token
