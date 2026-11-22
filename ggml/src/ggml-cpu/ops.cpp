@@ -8989,8 +8989,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
 #if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
-        // F16 V: up to 8 rows are added to VKQ32 in one pass (one load/store of the accumulator per 8 rows)
-        const bool v_batch = v->type == GGML_TYPE_F16 && DV % 8 == 0;
+        // F16 V: up to 8 rows are added to VKQ32 in one pass (one load/store of the accumulator per 8 rows);
+        // the reference path stays row by row, test-backend-ops compares against it
+        const bool v_batch = !params->use_ref && v->type == GGML_TYPE_F16 && DV % 8 == 0;
         float               pw[8];
         const ggml_fp16_t * pv[8];
         int                 np = 0;
