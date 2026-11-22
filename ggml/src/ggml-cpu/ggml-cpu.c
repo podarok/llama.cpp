@@ -1548,8 +1548,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     float tmp[16];
 
 #if defined(__AVX2__) && defined(__FMA__)
-    // Q2_0 prefill: one block GEMM per 16 columns instead of row-by-row dots
-    if (!use_ref && type == GGML_TYPE_Q2_0 && vec_dot_type == GGML_TYPE_Q8_0 && ir1_end - ir1_start >= 2 &&
+    // Q2_0: one block GEMM per 16 columns instead of row-by-row dots (1 column = the 4-row decode GEMV)
+    if (!use_ref && type == GGML_TYPE_Q2_0 && vec_dot_type == GGML_TYPE_Q8_0 && ir1_end - ir1_start >= 1 &&
         ne00 <= GGML_Q2_0_GEMM_MAX_N && (src1_cont || src1->type != vec_dot_type)) {
         const void * cols[16];
         float * dcols[16];
