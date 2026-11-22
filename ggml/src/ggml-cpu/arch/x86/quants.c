@@ -806,13 +806,59 @@ void ggml_gemm_q2_0_q8_0(int n, float * const * out, const void * GGML_RESTRICT 
     const int nb = n / QK8_0; // Q8_0 blocks per column, two per Q2_0 block
 
     const int nx = n / QK2_0; // Q2_0 blocks per row
+    const __m256i ones = _mm256_set1_epi8(1);
+
+    if (nc == 1) {
+        // decode GEMV: 4 rows per activation load, the activation sums once for all rows
+        const block_q8_0 * y = (const block_q8_0 * ) vy[0];
+        float dy1[GGML_Q2_0_GEMM_MAX_N / QK8_0];
+        float cy1[GGML_Q2_0_GEMM_MAX_N / QK2_0];
+        for (int ib = 0; ib < nx; ib++) {
+            float c = 0.0f;
+            for (int h = 0; h < 2; h++) {
+                const __m256i yv = _mm256_loadu_si256((const __m256i *) y[2*ib + h].qs);
+                dy1[2*ib + h] = GGML_CPU_FP16_TO_FP32(y[2*ib + h].d);
+                c += dy1[2*ib + h] * (float) hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(ones, yv), _mm256_set1_epi16(1)));
+            }
+            cy1[ib] = c;
+        }
+        int r = 0;
+        for (; r < nr; r += 4) {
+            const int rn = nr - r < 4 ? nr - r : 4;
+            const block_q2_0 * xr[4];
+            for (int k = 0; k < 4; k++) {
+                xr[k] = (const block_q2_0 *) ((const char *) vx + (r + (k < rn ? k : 0)) * bx);
+            }
+            __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+            float corr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            for (int ib = 0; ib < nx; ib++) {
+                float dx[4];
+                for (int k = 0; k < 4; k++) {
+                    dx[k]    = GGML_CPU_FP16_TO_FP32(xr[k][ib].d);
+                    corr[k] += dx[k] * cy1[ib];
+                }
+                for (int h = 0; h < 2; h++) {
+                    const __m256i yv = _mm256_loadu_si256((const __m256i *) y[2*ib + h].qs);
+                    const float   d  = dy1[2*ib + h];
+                    for (int k = 0; k < 4; k++) {
+                        const __m256i v = q2_0_unpack_32_avx2(xr[k][ib].qs + 8 * h);
+                        acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(dx[k] * d), _mm256_cvtepi32_ps(q2_0_dot_u8s8_avx2(v, yv)), acc[k]);
+                    }
+                }
+            }
+            for (int k = 0; k < rn; k++) {
+                out[0][r + k] = hsum_float_8(acc[k]) - corr[k];
+            }
+        }
+        return;
+    }
+
     float dy[16][GGML_Q2_0_GEMM_MAX_N / QK8_0];
     float cy[16][GGML_Q2_0_GEMM_MAX_N / QK2_0]; // dy * sum(y), summed over the two Q8_0 halves of a Q2_0 block
     const block_q8_0 * ycol[16];
     for (int c = 0; c < 16; c++) {
         ycol[c] = (const block_q8_0 *) vy[c < nc ? c : nc - 1]; // pad to a multiple of 4 with the last column
     }
-    const __m256i ones = _mm256_set1_epi8(1);
     for (int c = 0; c < nc; c++) {
         for (int b = 0; b < nb; b++) {
             const __m256i y = _mm256_loadu_si256((const __m256i *) ycol[c][b].qs);
