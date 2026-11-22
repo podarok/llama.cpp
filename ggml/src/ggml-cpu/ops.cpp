@@ -9089,6 +9089,24 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
+#if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
+        // F16 V: up to 8 rows are added to VKQ32 in one pass (one load/store of the accumulator per 8 rows)
+        const bool v_batch = v->type == GGML_TYPE_F16 && DV % 8 == 0;
+        float               pw[8];
+        const ggml_fp16_t * pv[8];
+        int                 np = 0;
+        auto v_flush = [&]() {
+            for (int64_t d = 0; d < DV; d += 8) {
+                __m256 acc = _mm256_loadu_ps(VKQ32 + d);
+                for (int j = 0; j < np; j++) {
+                    acc = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (pv[j] + d))), _mm256_set1_ps(pw[j]), acc);
+                }
+                _mm256_storeu_ps(VKQ32 + d, acc);
+            }
+            np = 0;
+        };
+#endif
+
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
@@ -9127,12 +9145,26 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
                 // V = V*expf(Mold - M)
                 ggml_vec_scale_f32(DV, VKQ32, ms);
+#if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
+                for (int j = 0; j < np; j++) {
+                    pw[j] *= ms;
+                }
+#endif
             } else {
                 // no new maximum, ms == 1.0f, vs != 1.0f
                 vs = expf(s - M);
             }
 
             // V += v*expf(s - M)
+#if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
+            if (v_batch) {
+                pv[np] = (const ggml_fp16_t *) v_data;
+                pw[np] = vs;
+                if (++np == 8) {
+                    v_flush();
+                }
+            } else
+#endif
             if (v->type == GGML_TYPE_F16) {
                 ggml_vec_mad_f16_f32(DV, VKQ32, (const ggml_fp16_t *) v_data, vs);
             } else if (v_to_float) {
@@ -9145,6 +9177,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             S = S*ms + vs; // scale and increment sum with partial sum
         }
+#if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
+        if (np > 0) {
+            v_flush();
+        }
+#endif
 
         // sinks - apply only on the first kv-chunk
         if (sinks && ic_start == 0) {
