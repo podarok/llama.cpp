@@ -1,4 +1,7 @@
 #include "unary-ops.h"
+#include "vec.h"
+
+#include <type_traits>
 
 static inline float op_abs(float x) {
     return fabsf(x);
@@ -97,12 +100,39 @@ static inline float op_trunc(float x) {
     return truncf(x);
 }
 
+// ops with an f32 SIMD path in vec_unary_op: 1 = tanh, 2 = sigmoid
+template <float (*op)(float)> constexpr int simd_f32_op = 0;
+template <> constexpr int simd_f32_op<op_tanh> = 1;
+template <> constexpr int simd_f32_op<op_sigmoid> = 2;
+
 template <float (*op)(float), typename src0_t, typename dst_t>
 static inline void vec_unary_op(int64_t n, dst_t * y, const src0_t * x) {
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
-    for (int i = 0; i < n; i++) {
+    int64_t i = 0;
+#if defined(__AVX2__) && defined(__FMA__) && !defined(__AVX512F__)
+    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, float> && simd_f32_op<op> != 0) {
+        const __m256 one = _mm256_set1_ps(1.0f);
+        for (; i + 8 <= n; i += 8) {
+            const __m256 v = _mm256_loadu_ps(x + i);
+            if constexpr (simd_f32_op<op> == 1) {
+                // tanh(x) = 1 - 2/(exp(2x) + 1); |x| < 1/16 uses x - x^3/3 + 2x^5/15 (cancellation near 0)
+                const __m256 big = _mm256_sub_ps(one, _mm256_div_ps(_mm256_set1_ps(2.0f),
+                                       _mm256_add_ps(ggml_v_expf(_mm256_add_ps(v, v)), one)));
+                const __m256 v2 = _mm256_mul_ps(v, v);
+                const __m256 small = _mm256_fmadd_ps(_mm256_mul_ps(v, v2),
+                                       _mm256_fmadd_ps(v2, _mm256_set1_ps(2.0f/15.0f), _mm256_set1_ps(-1.0f/3.0f)), v);
+                const __m256 is_small = _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.0f), v),
+                                                      _mm256_set1_ps(0.0625f), _CMP_LT_OQ);
+                _mm256_storeu_ps(y + i, _mm256_blendv_ps(big, small, is_small));
+            } else {
+                _mm256_storeu_ps(y + i, _mm256_div_ps(one, _mm256_add_ps(one, ggml_v_expf(_mm256_sub_ps(_mm256_setzero_ps(), v)))));
+            }
+        }
+    }
+#endif
+    for (; i < n; i++) {
         y[i] = f32_to_dst(op(src0_to_f32(x[i])));
     }
 }
