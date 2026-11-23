@@ -9253,7 +9253,28 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1 + tq)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
                     const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1 + tq)*bias_indices->nb[1]) : nullptr;
-                    for (int tk = 0; tk < kv_tile; tk++) {
+                    int tk = 0;
+#if defined(__AVX2__) && defined(__F16C__)
+                    // same result as the scalar loop below, 8 keys at a time
+                    if (bias && n_bins <= INT32_MAX) {
+                        const __m256  vslope = _mm256_set1_ps(slope);
+                        const __m256  vninf  = _mm256_set1_ps(-INFINITY);
+                        const __m256i vnbins = _mm256_set1_epi32((int32_t) n_bins);
+                        const __m256i vneg1  = _mm256_set1_epi32(-1);
+                        for (; tk + 8 <= kv_tile; tk += 8) {
+                            const __m256i idx = _mm256_loadu_si256((const __m256i *) (bins + ic + tk));
+                            const __m256i ok  = _mm256_and_si256(_mm256_cmpgt_epi32(idx, vneg1), _mm256_cmpgt_epi32(vnbins, idx));
+                            GGML_ASSERT(_mm256_movemask_epi8(ok) == -1);
+                            const __m256 m = _mm256_add_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (mp_row + ic + tk))), _mm256_i32gather_ps(bias, idx, 4));
+                            const __m256 r = _mm256_mul_ps(m, vslope);
+                            _mm256_storeu_ps(mask32 + tq * KV_TILE_SZ + tk, r);
+                            if (_mm256_movemask_ps(_mm256_cmp_ps(r, vninf, _CMP_NEQ_UQ))) {
+                                can_skip = false;
+                            }
+                        }
+                    }
+#endif
+                    for (; tk < kv_tile; tk++) {
                         float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         if (bias) {
                             GGML_ASSERT(bins[ic + tk] >= 0 && bins[ic + tk] < n_bins);
